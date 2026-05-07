@@ -72,6 +72,30 @@ def fetch_article(lang, article):
         raise RuntimeError("empty response from Wikipedia")
     return title, html
 
+def resolve_redirects(lang, article):
+    """
+    Follow Wikipedia redirects to get the final article name.
+    Returns the final article name or the original if no redirect.
+    """
+    try:
+        # Use the Wikipedia API to check for redirects
+        redirect_url = f"https://{lang}.wikipedia.org/w/api.php?action=query&titles={urllib.parse.quote(article)}&redirects&format=json"
+        req = urllib.request.Request(redirect_url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        
+        query = data.get("query", {})
+        redirects = query.get("redirects", [])
+        if redirects:
+            # Get the final redirected title
+            for redirect in redirects:
+                if "to" in redirect:
+                    return redirect["to"].replace(" ", "_")
+    except Exception:
+        pass  # If redirect check fails, use original article
+    
+    return article
+
 # ── HTML → Wax conversion ────────────────────────────────────────────────────
 
 def node_to_text(node):
@@ -293,7 +317,7 @@ def search_wikipedia(lang, query, limit=10):
         results.append((t, d, u))
     return results
 
-def search_results_to_wax(query, results, base_url):
+def search_results_to_wax(query, results, base_url, lang):
     """Render search results as a Wax document."""
     out = []
     out.append(f"#Search: {query}")
@@ -307,8 +331,10 @@ def search_results_to_wax(query, results, base_url):
     out.append(f"$$7{len(results)} results for $$f{query}$$r")
     out.append("")
     for title, desc, _url in results:
+        # Resolve redirects to get the final article name
         article_key = title.replace(" ", "_")
-        link_url    = f"{base_url}/{urllib.parse.quote(article_key)}"
+        final_article = resolve_redirects(lang, article_key)
+        link_url    = f"{base_url}/{urllib.parse.quote(final_article)}"
         out.append(f"=> {link_url} {title}")
         if desc:
             # wrap description, indented
@@ -387,6 +413,11 @@ def make_handler(port, lang):
             body = f"#Error\n\n{msg}\n\n=> {base_url}/ wickwiki home\n"
             self.send_wax(body, status)
 
+        def do_HEAD(self):
+            # Disable HEAD requests to avoid the caching bug
+            self.send_error(501, "Unsupported method ('HEAD')")
+            return
+
         def do_GET(self):
             parsed   = urllib.parse.urlparse(self.path)
             path     = urllib.parse.unquote(parsed.path.lstrip("/")).strip()
@@ -398,7 +429,7 @@ def make_handler(port, lang):
                 if query:
                     try:
                         results = search_wikipedia(lang, query)
-                        wax = search_results_to_wax(query, results, base_url)
+                        wax = search_results_to_wax(query, results, base_url, lang)
                     except RuntimeError as e:
                         wax = f"#Search error\n\n{e}\n\n=> {base_url}/ wickwiki home\n"
                     self.send_wax(wax)
@@ -409,12 +440,28 @@ def make_handler(port, lang):
 
             # path → article title
             article = path.replace(" ", "_")
+            # Resolve redirects to get the actual article name
+            final_article = resolve_redirects(lang, article)
             try:
-                title, html = fetch_article(lang, article)
+                title, html = fetch_article(lang, final_article)
                 wax = convert_html_to_wax(html, title, base_url)
                 self.send_wax(wax)
             except RuntimeError as e:
-                self.send_error_wax(str(e))
+                # Try to suggest the correct article name if it's a common misspelling
+                error_msg = str(e)
+                if "doesn't exist" in error_msg:
+                    # Try a few common variations
+                    suggestions = []
+                    if "Nuclear Event Scale" in article:
+                        suggestions.append("International_Nuclear_and_Radiological_Event_Scale")
+                    
+                    if suggestions:
+                        suggestion_text = "\n\nDid you mean:\n" + "\n".join([f"=> {base_url}/{s}" for s in suggestions])
+                        self.send_error_wax(f"{error_msg}{suggestion_text}")
+                    else:
+                        self.send_error_wax(error_msg)
+                else:
+                    self.send_error_wax(error_msg)
 
     return WikiHandler
 

@@ -38,18 +38,22 @@ The `##` characters are included in the rendered output.
 ### Link
 
 ```
-=> URL label text
+=> URL label 
+=> URL#filename label 
 ```
 
 A line beginning with `=>` is a link. The format is:
 
 ```
 => <url> <label...>
+=> <url>#<filename> <label...>
 ```
 
 - `url` — the destination, no spaces. Can be a local `.wax` file path or a full URL.
-- `label` — everything after the first whitespace following the URL. May contain spaces.
+- `filename` — optional filename for download (after `#`, no spaces). When present, browsers should initiate a download instead of navigation.
+- `label` — everything after the first whitespace following the URL (or `#filename`). May contain spaces.
 
+**Navigation links:**
 Browsers render links as numbered buttons:
 
 ```
@@ -58,6 +62,13 @@ Browsers render links as numbered buttons:
 
 Numbers are assigned sequentially from 1 as links appear in the document.
 The user activates a link by pressing its number. No cursor navigation is used.
+
+**Download links:**
+If a link URL ends with `#filename` (no spaces between `#` and filename), browsers should:
+1. Strip the `#filename` part from the URL before making the request
+2. Prompt the user with download information (filename, file size, destination path)
+3. If user confirms, download the content to the user's Downloads folder with the specified filename
+4. Show download progress and remain on the current page after completion
 
 After rendering, browsers should show a summary list of all links with their
 numbers, URLs, and labels so the user can review before navigating.
@@ -112,6 +123,8 @@ this is some $$eregular text$$r with a splash of color!
 check out these links:
 => http://example.com/ Example Site
 => notes.wax My local notes
+=> http://example.com/data.csv#data.csv Download dataset
+=> http://localhost:8421/article.pdf#article.pdf Save article as PDF
 ```
 
 Rendered output:
@@ -123,21 +136,12 @@ this is some regular text with a splash of color!
 check out these links:
 [1] Example Site
 [2] My local notes
+[3] Download dataset
+[4] Save article as PDF
 ```
 
 ---
 
-## Browser behavior
-
-- No cursor or focus indicator. Navigation is number-key only.
-- Links are numbered `[1]`, `[2]`, etc. in order of appearance.
-- After rendering, browsers display a link summary and prompt for a number.
-- Entering a number navigates to that link's URL.
-- If the URL is a local path to a `.wax` file, it is rendered in-browser.
-- If the URL is a remote address, the browser should hand it off to the
-  system's default URL handler.
-
----
 
 ## File extension and MIME type
 

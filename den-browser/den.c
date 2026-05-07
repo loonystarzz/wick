@@ -18,6 +18,12 @@
 #include <strings.h>
 #include <ctype.h>
 
+/* ── forward declarations ───────────────────────────────────────────────── */
+static void show_download_progress(int rows, int cols, const char *filename,
+                                  curl_off_t downloaded, long total);
+static int perform_download(const char *url, const char *filename,
+                           const char *path, int rows, int cols);
+
 /* ── limits ─────────────────────────────────────────────────────────────── */
 #define MAX_PARSED   4096
 #define MAX_DLINES  16384
@@ -25,6 +31,8 @@
 #define MAX_URL       512
 #define MAX_LABEL     256
 #define MAX_RAW      1024
+#define MAX_FILENAME  256
+#define MAX_PATH      512
 
 /* ── colour pairs ────────────────────────────────────────────────────────── */
 #define CP_DEFAULT   1
@@ -51,6 +59,8 @@
 #define CP_URLBAR   22
 #define CP_URLLABEL 23
 #define CP_ERROR    24
+#define CP_DOWNLOAD 25
+#define CP_PROMPT   26
 
 static int code_to_pair(char c) {
     switch (c) {
@@ -88,6 +98,17 @@ typedef struct {
     char label[MAX_LABEL];
 } Link;
 
+typedef struct {
+    char url[MAX_URL];
+    char filename[MAX_FILENAME];
+    char path[MAX_PATH];
+    long content_length;
+    int active;
+    curl_off_t downloaded;
+    CURL *curl;
+    FILE *file;
+} DownloadInfo;
+
 /* ── globals ─────────────────────────────────────────────────────────────── */
 static SLine slines[MAX_PARSED];
 static int   sline_count = 0;
@@ -96,6 +117,7 @@ static int   dline_count = 0;
 static Link  lnks[MAX_LINKS];
 static int   link_count  = 0;
 static int   last_page_w = 0;
+static DownloadInfo current_download = {0};
 
 /* ── curl write buffer ───────────────────────────────────────────────────── */
 typedef struct { char *data; size_t size; } CurlBuf;
@@ -140,6 +162,95 @@ static char *fetch_url(const char *url, char *errbuf, size_t errbuf_sz) {
     }
     errbuf[0] = '\0';
     return buf.data; /* caller must free() */
+}
+
+/* ── download progress callback ────────────────────────────────────────────── */
+static int download_progress(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                            curl_off_t ultotal, curl_off_t ulnow) {
+    DownloadInfo *dl = (DownloadInfo *)clientp;
+    dl->downloaded = dlnow;
+    
+    /* Update progress display */
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    show_download_progress(rows, cols, dl->filename, dlnow, dl->content_length);
+    
+    return 0;
+}
+
+/* ── curl write callback for downloads ───────────────────────────────────────── */
+static size_t download_write(void *ptr, size_t sz, size_t nmemb, void *userdata) {
+    DownloadInfo *dl = (DownloadInfo *)userdata;
+    size_t written = fwrite(ptr, sz, nmemb, dl->file);
+    return written;
+}
+
+/* ── check if URL has #download fragment ─────────────────────────────────────── */
+static int is_download_url(const char *url, char *clean_url, size_t clean_len, 
+                           char *filename, size_t fn_len) {
+    /* Find the # character */
+    const char *hash_pos = strchr(url, '#');
+    if (!hash_pos) {
+        /* No #, not a download URL */
+        strncpy(clean_url, url, clean_len - 1);
+        clean_url[clean_len - 1] = '\0';
+        return 0;
+    }
+    
+    /* Extract everything after # as filename */
+    const char *filename_start = hash_pos + 1;
+    if (*filename_start == '\0') {
+        /* Empty filename, not a download URL */
+        strncpy(clean_url, url, clean_len - 1);
+        clean_url[clean_len - 1] = '\0';
+        return 0;
+    }
+    
+    /* Copy clean URL (everything before #) */
+    size_t clean_url_len = hash_pos - url;
+    if (clean_url_len >= clean_len) clean_url_len = clean_len - 1;
+    strncpy(clean_url, url, clean_url_len);
+    clean_url[clean_url_len] = '\0';
+    
+    /* Ensure URL has proper scheme for curl */
+    char temp_url[MAX_URL];
+    strncpy(temp_url, clean_url, sizeof(temp_url) - 1);
+    temp_url[sizeof(temp_url) - 1] = '\0';
+    
+    /* If URL doesn't start with http:// or https://, add http:// */
+    if (strncmp(temp_url, "http://", 7) != 0 && strncmp(temp_url, "https://", 8) != 0) {
+        snprintf(clean_url, clean_len, "http://%s", temp_url);
+    }
+    
+    /* Copy filename (everything after #) */
+    strncpy(filename, filename_start, fn_len - 1);
+    filename[fn_len - 1] = '\0';
+    
+    return 1;
+}
+
+/* ── get content length of URL ──────────────────────────────────────────────── */
+static long get_content_length(const char *url) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "den/1.0 (Wick)");
+    
+    CURLcode res = curl_easy_perform(curl);
+    long content_length = -1;
+    
+    if (res == CURLE_OK) {
+        curl_off_t content_length_t;
+        curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length_t);
+        content_length = (long)content_length_t;
+    }
+    
+    curl_easy_cleanup(curl);
+    return content_length;
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -352,6 +463,8 @@ static void init_colors(void) {
     init_pair(CP_URLBAR,   COLOR_WHITE,   COLOR_BLACK);
     init_pair(CP_URLLABEL, COLOR_CYAN,    COLOR_BLACK);
     init_pair(CP_ERROR,    COLOR_WHITE,   COLOR_RED);
+    init_pair(CP_DOWNLOAD, COLOR_GREEN,   COLOR_BLACK);
+    init_pair(CP_PROMPT,   COLOR_CYAN,    COLOR_BLACK);
 }
 
 /* ── draw coloured text ──────────────────────────────────────────────────── */
@@ -491,6 +604,95 @@ static void show_error(int rows, int cols, const char *msg) {
     napms(2000); /* show for 2 seconds */
 }
 
+/* ── show download prompt ───────────────────────────────────────────────────── */
+static int show_download_prompt(int rows, int cols, const char *filename,
+                               long size, const char *path) {
+    char size_str[64];
+    if (size > 0) {
+        if (size < 1024) {
+            snprintf(size_str, sizeof(size_str), "%ld B", size);
+        } else if (size < 1024*1024) {
+            snprintf(size_str, sizeof(size_str), "%.1f KB", size/1024.0);
+        } else {
+            snprintf(size_str, sizeof(size_str), "%.1f MB", size/(1024.0*1024.0));
+        }
+    } else {
+        strncpy(size_str, "unknown size", sizeof(size_str)-1);
+        size_str[sizeof(size_str)-1] = '\0';
+    }
+    
+    /* Clear screen and show prompt */
+    erase();
+    
+    int prompt_y = rows/2 - 2;
+    
+    attron(COLOR_PAIR(CP_PROMPT)|A_BOLD);
+    mvprintw(prompt_y,     2, "Download file?");
+    attroff(COLOR_PAIR(CP_PROMPT)|A_BOLD);
+    
+    attron(COLOR_PAIR(CP_DOWNLOAD));
+    mvprintw(prompt_y + 1, 2, "Filename: %s", filename);
+    mvprintw(prompt_y + 2, 2, "Size:     %s", size_str);
+    mvprintw(prompt_y + 3, 2, "Path:     %s", path);
+    attroff(COLOR_PAIR(CP_DOWNLOAD));
+    
+    attron(COLOR_PAIR(CP_PROMPT)|A_BOLD);
+    mvprintw(prompt_y + 5, 2, "Download? [y/n]: ");
+    attroff(COLOR_PAIR(CP_PROMPT)|A_BOLD);
+    
+    refresh();
+    
+    /* Wait for y/n response */
+    for (;;) {
+        int ch = getch();
+        if (ch == 'y' || ch == 'Y') return 1;
+        if (ch == 'n' || ch == 'N' || ch == 27) return 0;
+    }
+}
+
+/* ── show download progress ─────────────────────────────────────────────────── */
+static void show_download_progress(int rows, int cols, const char *filename,
+                                  curl_off_t downloaded, long total) {
+    int bar_y = rows - 2;
+    int bar_width = cols - 20;
+    
+    if (bar_width < 10) bar_width = 10;
+    
+    /* Clear progress area */
+    attron(COLOR_PAIR(CP_BAR));
+    mvhline(bar_y, 0, ' ', cols);
+    attroff(COLOR_PAIR(CP_BAR));
+    
+    /* Calculate percentage */
+    int percent = 0;
+    if (total > 0) {
+        percent = (int)((downloaded * 100) / total);
+        if (percent > 100) percent = 100;
+    }
+    
+    /* Draw progress bar */
+    int filled = (percent * bar_width) / 100;
+    
+    attron(COLOR_PAIR(CP_DOWNLOAD)|A_BOLD);
+    mvprintw(bar_y, 1, "Downloading %s: %d%%", filename, percent);
+    attroff(COLOR_PAIR(CP_DOWNLOAD)|A_BOLD);
+    
+    /* Progress bar */
+    attron(COLOR_PAIR(CP_BAR));
+    for (int i = 0; i < bar_width; i++) {
+        if (i < filled) {
+            attron(COLOR_PAIR(CP_DOWNLOAD)|A_REVERSE);
+            mvaddch(bar_y, 15 + i, ' ');
+            attroff(COLOR_PAIR(CP_DOWNLOAD)|A_REVERSE);
+        } else {
+            mvaddch(bar_y, 15 + i, '-');
+        }
+    }
+    attroff(COLOR_PAIR(CP_BAR));
+    
+    refresh();
+}
+
 /* ── built-in Wick homepage ──────────────────────────────────────────────── */
 static const char *DEN_HOME =
 "#Wick\n"
@@ -548,6 +750,118 @@ static int looks_like_wax(const char *content) {
     return 1; /* plain text with no wax markers is still valid wax */
 }
 
+/* ── perform download with fallback mechanism ─────────────────────────────────── */
+static int perform_download_with_fallback(const char *url, const char *filename,
+                                          const char *path, int rows, int cols) {
+    /* First try the original URL */
+    int result = perform_download(url, filename, path, rows, cols);
+    if (result) return 1; /* Success */
+    
+    /* If original failed, try the index.wax fallback like the browser does */
+    char fallback_url[MAX_URL];
+    int len = (int)strlen(url);
+    if (url[len-1] == '/') {
+        snprintf(fallback_url, sizeof(fallback_url), "%sindex.wax", url);
+    } else {
+        snprintf(fallback_url, sizeof(fallback_url), "%s/index.wax", url);
+    }
+    
+    /* Try downloading from fallback URL */
+    char errbuf[256] = "";
+    char *content = fetch_url(fallback_url, errbuf, sizeof(errbuf));
+    
+    if (content) {
+        /* Write the fallback content to file */
+        char full_path[MAX_PATH];
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, filename);
+        
+        FILE *f = fopen(full_path, "wb");
+        if (f) {
+            size_t written = fwrite(content, 1, strlen(content), f);
+            fclose(f);
+            
+            if (written == strlen(content)) {
+                char success_msg[300];
+                snprintf(success_msg, sizeof(success_msg), "downloaded: %s", full_path);
+                show_error(rows, cols, success_msg);
+                free(content);
+                return 1;
+            }
+        }
+        free(content);
+    }
+    
+    /* Both failed */
+    show_error(rows, cols, "download failed");
+    return 0;
+}
+static int perform_download(const char *url, const char *filename,
+                           const char *path, int rows, int cols) {
+    /* Construct full file path */
+    char full_path[MAX_PATH];
+    snprintf(full_path, sizeof(full_path), "%s/%s", path, filename);
+    
+    /* Open file for writing */
+    FILE *f = fopen(full_path, "wb");
+    if (!f) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "cannot create file: %s", full_path);
+        show_error(rows, cols, msg);
+        return 0;
+    }
+    
+    /* Initialize download info */
+    memset(&current_download, 0, sizeof(current_download));
+    strncpy(current_download.url, url, sizeof(current_download.url)-1);
+    strncpy(current_download.filename, filename, sizeof(current_download.filename)-1);
+    strncpy(current_download.path, path, sizeof(current_download.path)-1);
+    current_download.file = f;
+    current_download.active = 1;
+    
+    /* Initialize curl */
+    current_download.curl = curl_easy_init();
+    if (!current_download.curl) {
+        fclose(f);
+        show_error(rows, cols, "curl init failed for download");
+        return 0;
+    }
+    
+    /* Configure curl for download */
+    curl_easy_setopt(current_download.curl, CURLOPT_URL, url);
+    curl_easy_setopt(current_download.curl, CURLOPT_WRITEFUNCTION, download_write);
+    curl_easy_setopt(current_download.curl, CURLOPT_WRITEDATA, &current_download);
+    curl_easy_setopt(current_download.curl, CURLOPT_XFERINFOFUNCTION, download_progress);
+    curl_easy_setopt(current_download.curl, CURLOPT_XFERINFODATA, &current_download);
+    curl_easy_setopt(current_download.curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(current_download.curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(current_download.curl, CURLOPT_TIMEOUT, 300L); /* 5 minute timeout */
+    curl_easy_setopt(current_download.curl, CURLOPT_USERAGENT, "den/1.0 (Wick)");
+    
+    /* Get content length for progress */
+    current_download.content_length = get_content_length(url);
+    
+    /* Perform download with progress display */
+    CURLcode res = curl_easy_perform(current_download.curl);
+    
+    /* Cleanup */
+    curl_easy_cleanup(current_download.curl);
+    fclose(f);
+    current_download.active = 0;
+    
+    if (res != CURLE_OK) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "download failed: %s", curl_easy_strerror(res));
+        show_error(rows, cols, msg);
+        return 0;
+    }
+    
+    /* Show success message */
+    char success_msg[300];
+    snprintf(success_msg, sizeof(success_msg), "downloaded: %s", full_path);
+    show_error(rows, cols, success_msg);
+    return 1;
+}
+
 /* ── try appending index.wax to a bare URL ───────────────────────────────── */
 /* returns heap string (caller frees) or NULL */
 
@@ -555,6 +869,45 @@ static int looks_like_wax(const char *content) {
 /* fills current_url, loads content; returns 1 on success, 0 on error */
 static int navigate(const char *target, char *current_url, size_t url_sz,
                     int rows, int cols) {
+    /* Check if this is a download URL */
+    char clean_url[MAX_URL];
+    char filename[MAX_FILENAME];
+    if (is_download_url(target, clean_url, sizeof(clean_url), filename, sizeof(filename))) {
+        /* This is a download request */
+        if (!is_remote_url(clean_url)) {
+            show_error(rows, cols, "download only supported for remote URLs");
+            return 0;
+        }
+        
+        /* Get file size */
+        long file_size = get_content_length(clean_url);
+        
+        /* Show download prompt */
+        int download_path = show_download_prompt(rows, cols, filename, file_size, "~/Downloads");
+        
+        if (download_path) {
+            /* User chose to download - create Downloads directory if needed */
+            char home_downloads[MAX_PATH];
+            const char *home = getenv("HOME");
+            if (!home) home = ".";
+            snprintf(home_downloads, sizeof(home_downloads), "%s/Downloads", home);
+            
+            /* Create directory if it doesn't exist (mkdir may fail, that's ok) */
+            char mkdir_cmd[MAX_PATH + 10];
+            snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", home_downloads);
+            system(mkdir_cmd);
+            
+            /* Perform download with fallback mechanism */
+            int result = perform_download_with_fallback(clean_url, filename, home_downloads, rows, cols);
+            
+            /* After download, go back to previous page by not changing current_url */
+            return result ? 2 : 0; /* 2 = download completed, stay on current page */
+        } else {
+            /* User chose not to download - go back to previous page */
+            return 2; /* Stay on current page */
+        }
+    }
+    
     /* built-in home page */
     if (strcmp(target, "wick://home") == 0 || strcmp(target, "home") == 0) {
         load_from_string(DEN_HOME);
@@ -757,7 +1110,9 @@ static void browse(const char *initial) {
                         && new_url[0]) {
                     int ok = navigate(new_url,current_url,sizeof(current_url),
                                       rows,cols);
-                    if (ok) { scroll=0; last_page_w=0; }
+                    if (ok == 1) { scroll=0; last_page_w=0; }
+                    /* ok == 2 means download completed or cancelled, stay on current page */
+                    /* ok == 0 means error, stay on current page */
                 }
                 break;
             }
@@ -781,7 +1136,9 @@ static void browse(const char *initial) {
                         const char *url=lnks[idx].url;
                         int ok=navigate(url,current_url,sizeof(current_url),
                                         rows,cols);
-                        if (ok){scroll=0;last_page_w=0;}
+                        if (ok == 1) {scroll=0;last_page_w=0;}
+                        /* ok == 2 means download completed or cancelled, stay on current page */
+                        /* ok == 0 means error, stay on current page */
                     }
                 }
                 break;
