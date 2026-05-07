@@ -1,0 +1,3 @@
+run python3 wickypedia.py --serve
+
+this is wikipedia translator thing for wick

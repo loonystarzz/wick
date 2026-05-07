@@ -1,0 +1,1 @@
+gcc den.c -lncurses -lcurl -o den
