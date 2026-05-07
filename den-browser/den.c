@@ -23,6 +23,7 @@ static void show_download_progress(int rows, int cols, const char *filename,
                                   curl_off_t downloaded, long total);
 static int perform_download(const char *url, const char *filename,
                            const char *path, int rows, int cols);
+static void reset_focus(void);
 
 /* ── limits ─────────────────────────────────────────────────────────────── */
 #define MAX_PARSED   4096
@@ -117,6 +118,7 @@ static int   dline_count = 0;
 static Link  lnks[MAX_LINKS];
 static int   link_count  = 0;
 static int   last_page_w = 0;
+static int   focused_link = -1;  /* -1 means no focus */
 static DownloadInfo current_download = {0};
 
 /* ── curl write buffer ───────────────────────────────────────────────────── */
@@ -312,6 +314,7 @@ static void load_from_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { endwin(); perror(path); exit(1); }
     sline_count = 0; link_count = 0;
+    reset_focus();  /* Reset focus when loading new content */
     char buf[MAX_RAW];
     while (fgets(buf, sizeof(buf), f)) parse_line(buf);
     fclose(f);
@@ -321,16 +324,25 @@ static void load_from_file(const char *path) {
 /* ── load from a string (fetched content) ────────────────────────────────── */
 static void load_from_string(const char *content) {
     sline_count = 0; link_count = 0;
+    reset_focus();  /* Reset focus when loading new content */
     const char *p = content;
     char buf[MAX_RAW];
     while (*p) {
-        int i = 0;
-        while (*p && *p != '\n' && i < MAX_RAW-1) buf[i++] = *p++;
-        if (*p == '\n') p++;
-        buf[i++] = '\n'; buf[i] = '\0';
-        parse_line(buf);
+        const char *nl = strchr(p, '\n');
+        if (!nl) {
+            strncpy(buf, p, MAX_RAW-1);
+            buf[MAX_RAW-1] = '\0';
+            parse_line(buf);
+            break;
+        } else {
+            int len = nl - p;
+            if (len >= MAX_RAW) len = MAX_RAW-1;
+            strncpy(buf, p, len);
+            buf[len] = '\0';
+            parse_line(buf);
+            p = nl + 1;
+        }
     }
-    last_page_w = 0;
 }
 
 /* ── header width ────────────────────────────────────────────────────────── */
@@ -344,6 +356,23 @@ static int min_header_width(void) {
         if (needed > w) w = needed;
     }
     return w;
+}
+
+/* ── focus navigation ───────────────────────────────────────────────────── */
+static int find_next_link(int current) {
+    if (link_count == 0) return -1;
+    if (current < 0 || current >= link_count) return 0;
+    return (current + 1) % link_count;
+}
+
+static int find_prev_link(int current) {
+    if (link_count == 0) return -1;
+    if (current < 0 || current >= link_count) return link_count - 1;
+    return (current - 1 + link_count) % link_count;
+}
+
+static void reset_focus(void) {
+    focused_link = -1;
 }
 
 /* ── word-wrap into dlines[] ─────────────────────────────────────────────── */
@@ -495,13 +524,23 @@ static void draw_dline(int row, int page_x, int page_w, const DLine *dl) {
             break;
         case LT_LINK: {
             int num_w=(dl->link_index>=9)?4:3;
+            int is_focused = (dl->link_index == focused_link);
             if (!dl->is_cont) {
                 move(row,page_x);
-                attron(COLOR_PAIR(CP_LINK)|A_BOLD);
+                if (is_focused) {
+                    attron(COLOR_PAIR(CP_LINK)|A_BOLD|A_REVERSE);
+                } else {
+                    attron(COLOR_PAIR(CP_LINK)|A_BOLD);
+                }
                 printw("[%d]",dl->link_index+1);
-                attroff(COLOR_PAIR(CP_LINK)|A_BOLD);
+                if (is_focused) {
+                    attroff(COLOR_PAIR(CP_LINK)|A_BOLD|A_REVERSE);
+                } else {
+                    attroff(COLOR_PAIR(CP_LINK)|A_BOLD);
+                }
             }
-            draw_colored_text(row,page_x+num_w+1,max_col,dl->text,A_NORMAL,CP_DEFAULT);
+            int color = is_focused ? CP_LINK : CP_DEFAULT;
+            draw_colored_text(row,page_x+num_w+1,max_col,dl->text,A_NORMAL,color);
             break;
         }
         default:
@@ -562,9 +601,9 @@ static void draw_bar(int rows, int cols, int scroll,
         int pos_len=(int)strlen(pos);
 
         /* tiered hint strings — pure ASCII, no multi-byte chars */
-        const char *hints_full  = "space:URL  ^v/jk  PgUp/Dn  [1-9]link  q quit";
-        const char *hints_short = "spc:URL jk PgUpDn [1-9] q quit";
-        const char *hints_min   = "spc jk q";
+        const char *hints_full  = "space:URL  ^v/jk  PgUp/Dn  [1-9]link  Tab/Shift+Tab focus  q quit";
+        const char *hints_short = "spc:URL jk PgUpDn [1-9] Tab/Shift+Tab q quit";
+        const char *hints_min   = "spc jk Tab q";
         const char *hints = "";
         if (cols >= 80)      hints = hints_full;
         else if (cols >= 55) hints = hints_short;
@@ -1123,6 +1162,21 @@ static void browse(const char *initial) {
             case KEY_NPAGE:          scroll += visible-1;   break;
             case KEY_HOME: case 'g': scroll = 0;            break;
             case KEY_END:  case 'G': scroll = max_scroll;   break;
+            case '\t': /* Tab - move focus to next link */
+                focused_link = find_next_link(focused_link);
+                break;
+            case KEY_BTAB: /* Shift+Tab - move focus to previous link */
+                focused_link = find_prev_link(focused_link);
+                break;
+            case '\n': case '\r': case KEY_ENTER: /* Enter - activate focused link */
+                if (focused_link >= 0 && focused_link < link_count) {
+                    const char *url = lnks[focused_link].url;
+                    int ok = navigate(url,current_url,sizeof(current_url),rows,cols);
+                    if (ok == 1) {scroll=0;last_page_w=0;}
+                    /* ok == 2 means download completed or cancelled, stay on current page */
+                    /* ok == 0 means error, stay on current page */
+                }
+                break;
             case 'h': {
                 int ok = navigate("wick://home",current_url,sizeof(current_url),rows,cols);
                 if (ok){scroll=0;last_page_w=0;}
