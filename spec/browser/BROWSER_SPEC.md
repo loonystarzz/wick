@@ -52,6 +52,45 @@ Wick browsers are mostly minimalist terminal browsers designed for the Wax web l
 - Reset color state at end of each line
 - No color persistence across lines
 
+#### Page Metadata Directives (`--bgcol` / `--txcol`)
+
+Wax documents may begin with `--bgcol` and/or `--txcol` directives that
+declare an author-preferred background color and default text color.
+These lines are **never rendered as page content** — they are metadata only.
+
+**Capability tiers:**
+
+| Tier | Description | Required behavior |
+|------|-------------|-------------------|
+| **Supporting** | Color-capable terminal or graphical browser | Apply the declared colors when rendering the page. May show the values in a status bar, info panel, or similar out-of-band area. |
+| **Non-supporting** | Basic terminal browser with no custom background support | Silently skip the directive lines. Render the page as normal with no color changes. |
+
+**Rules for all browsers:**
+- The directive lines must **never appear as visible text** in the page body
+  under any circumstances.
+- If a supporting browser cannot apply a particular color (e.g. the terminal
+  does not support the requested background color), it should fall back
+  gracefully and not error.
+- Directives appearing outside the file header (i.e. not before the first
+  content line) may be treated as plain text lines.
+
+**Example of out-of-band display in a supporting browser:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Document Content Area                        │
+│  #Header text                                                    │
+│  ##Subheader text                                                │
+│  Regular text content                                            │
+│  [1] Link label                                                  │
+└─────────────────────────────────────────────────────────────────┘
+│ Status bar: current_url | bg: black  tx: white | status msgs  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The color values are shown in the status bar; they do not appear in the
+content area.
+
 ---
 
 ## Navigation

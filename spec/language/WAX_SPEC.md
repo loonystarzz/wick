@@ -11,6 +11,10 @@ A Wax document is a plain text file. Each line is one of four types:
 **header**, **subheader**, **link**, or **text**. Line type is determined
 by the first character(s) of the line.
 
+Optionally, a document may begin with one or both **page metadata directives**
+(`--bgcol` and `--txcol`) before any content lines. These are described in the
+[Page Metadata Directives](#page-metadata-directives) section below.
+
 ---
 
 ## Line types
@@ -142,6 +146,79 @@ check out these links:
 
 ---
 
+## Page metadata directives
+
+Page metadata directives are optional special lines that **must appear at the
+very start of the file**, before any content lines. They declare preferred
+colors for the page background and default text. Browsers that support them
+may use these values to style the page; browsers that do not support them
+(for example, basic terminal browsers that cannot set a custom background)
+**must silently ignore these lines** — they must never appear as visible
+content in the rendered page.
+
+There are two directives:
+
+### `--bgcol` — background color
+
+```
+--bgcol <color>
+```
+
+Declares the author's preferred background color for the page. `<color>` is a
+single color token from the standard Wax color table (see [Color codes](#color-codes)).
+
+### `--txcol` — default text color
+
+```
+--txcol <color>
+```
+
+Declares the author's preferred default text color (i.e. the color used for
+text lines before any inline `$$x` code). `<color>` is a single color token
+from the standard Wax color table.
+
+### Rules
+
+- Both directives are **optional**. Either, both, or neither may be present.
+- When present, they **must appear before any other lines** in the file.
+  A browser encountering them anywhere else may treat them as plain text.
+- The order of the two directives relative to each other does not matter,
+  as long as both precede all content lines.
+- Each directive occupies exactly one line.
+- The color token is the same single-character code used in inline color
+  codes (e.g. `0`–`9`, `a`–`f`). The `r` reset token is not valid here.
+- Browsers **must not render these lines as page content** under any
+  circumstances — they are metadata only.
+
+### Browser handling
+
+Browsers fall into two categories:
+
+**Supporting browsers** (graphical or color-capable terminal browsers) should
+apply the declared colors when rendering the page. They may display the color
+values in a separate info panel, status bar, or similar out-of-band location
+for user awareness, but the lines themselves must not appear inline in the
+page body.
+
+**Non-supporting browsers** (e.g. basic terminal browsers with no custom
+background support) must simply skip these lines and apply no special
+treatment. The page renders exactly as if the directives were absent.
+
+### Example
+
+```
+--bgcol 0
+--txcol f
+#My Wax Page
+##welcome to my little corner of the net
+this is some $$eregular text$$r with a splash of color!
+```
+
+In this example the author requests a black background (`0`) with white text
+(`f`). A supporting browser applies those colors; a non-supporting browser
+ignores both lines and renders the page normally.
+
+---
 
 ## File extension and MIME type
 
