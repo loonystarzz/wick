@@ -1,0 +1,1 @@
+assembly code i generated using claude for a simple wick browser (denasm) in assembly, and a standalone http GET tool (just enough to work for denasm). will likely not be maintained, was made as kind of a test about how capable ai is.
